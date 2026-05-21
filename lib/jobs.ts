@@ -19,7 +19,11 @@ const FEEDS: Record<Program, string> = {
   H2B: "https://api.seasonaljobs.dol.gov/datahub-search/sjCaseData/zip/h2b/{date}"
 };
 
-function todayISO() { return new Date().toISOString().slice(0, 10); }
+function isoDateDaysAgo(daysAgo: number) {
+  const date = new Date();
+  date.setUTCDate(date.getUTCDate() - daysAgo);
+  return date.toISOString().slice(0, 10);
+}
 function val(obj: any, names: string[]) {
   for (const name of names) {
     const key = Object.keys(obj || {}).find(k => k.toLowerCase() === name.toLowerCase());
@@ -38,15 +42,21 @@ function arrayFromJson(json: any): any[] {
   return [];
 }
 
-export async function fetchFeed(program: Program, date = todayISO()): Promise<JobRecord[]> {
-  const url = FEEDS[program].replace("{date}", date);
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`Feed failed ${program}: ${res.status}`);
-  const zip = await JSZip.loadAsync(await res.arrayBuffer());
-  const file = Object.values(zip.files).find(f => f.name.endsWith(".json"));
-  if (!file) throw new Error(`No JSON found in ${program} feed`);
-  const json = JSON.parse(await file.async("string"));
-  return arrayFromJson(json).map((item: any) => {
+export async function fetchFeed(program: Program, maxDaysBack = 7): Promise<JobRecord[]> {
+  let lastError: Error | null = null;
+
+  for (let daysAgo = 0; daysAgo <= maxDaysBack; daysAgo++) {
+    const date = isoDateDaysAgo(daysAgo);
+    const url = FEEDS[program].replace("{date}", date);
+
+    try {
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) throw new Error(`Feed failed ${program} ${date}: ${res.status}`);
+      const zip = await JSZip.loadAsync(await res.arrayBuffer());
+      const file = Object.values(zip.files).find(f => f.name.endsWith(".json"));
+      if (!file) throw new Error(`No JSON found in ${program} feed for ${date}`);
+      const json = JSON.parse(await file.async("string"));
+      const records = arrayFromJson(json).map((item: any) => {
     const caseNo = val(item, ["case_number", "caseNumber", "case_no", "case_no_", "CASE_NUMBER", "visa_case_number"]);
     const title = val(item, ["job_title", "jobTitle", "title", "JOB_TITLE", "occupation_title"]);
     const employer = val(item, ["employer_name", "employerName", "EMPLOYER_NAME", "business_name"]);
@@ -54,6 +64,16 @@ export async function fetchFeed(program: Program, date = todayISO()): Promise<Jo
     const state = val(item, ["worksite_state", "state", "WORKSITE_STATE"]);
     const email = firstEmail(item);
     const source = caseNo || crypto.createHash("sha1").update(JSON.stringify(item)).digest("hex");
-    return { source_id: `${program}-${source}`, program, case_number: caseNo || source, title, employer, city, state, contact_email: email, raw: item };
-  }).filter(j => j.contact_email);
+        return { source_id: `${program}-${source}`, program, case_number: caseNo || source, title, employer, city, state, contact_email: email, raw: item };
+      }).filter(j => j.contact_email);
+
+      if (records.length > 0) return records;
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error("Unknown feed error");
+    }
+  }
+
+  if (lastError) throw lastError;
+  return [];
 }
+
